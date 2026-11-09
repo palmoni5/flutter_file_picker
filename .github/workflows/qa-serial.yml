@@ -1,0 +1,589 @@
+name: Serial full QA
+run-name: Serial full QA ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: serial-full-qa-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+
+jobs:
+  check_changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      android: ${{ steps.filter.outputs.android }}
+      darwin: ${{ steps.filter.outputs.darwin }}
+      linux: ${{ steps.filter.outputs.linux }}
+      windows: ${{ steps.filter.outputs.windows }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            shared: &shared
+              - 'packages/file_picker/**'
+              - 'packages/file_picker_platform_interface/**'
+              - 'example/**'
+              - 'pubspec.yaml'
+              - '.github/workflows/**'
+            android:
+              - *shared
+              - 'packages/file_picker_android/**'
+            darwin:
+              - *shared
+              - 'packages/file_picker_darwin/**'
+            linux:
+              - *shared
+              - 'packages/file_picker_linux/**'
+            windows:
+              - *shared
+              - 'packages/file_picker_windows/**'
+            web:
+              - *shared
+              - 'packages/file_picker_web/**'
+
+  setup_flutter_versions:
+    needs: check_changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      flutter-versions: ${{ steps.id_flutter_versions.outputs.versions }}
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dart-lang/setup-dart@v1
+      - name: Fetch Flutter versions
+        id: id_flutter_versions
+        run: dart tool/fetch_versions.dart >> $GITHUB_OUTPUT
+
+  test_flutter_versions:
+    needs: setup_flutter_versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        flutter: ${{ fromJson(needs.setup_flutter_versions.outputs.flutter-versions) }}
+    name: Tests on Flutter ${{ matrix.flutter }}
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: subosito/flutter-action@v2
+        if: matrix.flutter == 'stable' || matrix.flutter == 'beta'
+        with:
+          channel: ${{ matrix.flutter }}
+          cache: true
+
+      - uses: subosito/flutter-action@v2
+        if: matrix.flutter != 'stable' && matrix.flutter != 'beta'
+        with:
+          flutter-version: ${{ matrix.flutter }}
+          cache: true
+
+      - run: flutter --version
+      - run: flutter precache
+
+      - uses: bluefireteam/melos-action@v3
+
+      - name: Verify formatting
+        if: matrix.flutter == 'stable'
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze project source
+        run: melos exec --concurrency=1 -- flutter analyze .
+
+      # `melos run test` relaunches melos through `dart run melos:melos`,
+      # which cannot find the global installation on Flutter 3.50 beta
+      # (https://github.com/blaugold/cli_launcher/issues/28). Calling exec
+      # directly, like the analyze step, avoids that.
+      - name: Run tests
+        run: melos exec --concurrency=1 -- flutter test
+
+      # flutter test runs on the Dart VM, which silently skips every test
+      # marked @TestOn('browser'), and most file_picker_web tests need a real
+      # DOM. Runners already ship Chrome, which web_integration_test uses too.
+      - name: Run web tests in Chrome
+        if: matrix.flutter == 'stable'
+        working-directory: packages/file_picker_web
+        run: flutter test --platform chrome
+
+      # tool/ is not a melos package, so `melos run test` never reaches it.
+      - name: Run CI tooling tests
+        if: matrix.flutter == 'stable'
+        run: flutter test tool/test
+
+      # Catches the facade allowing a platform implementation that predates
+      # the platform interface it requires: every constraint is individually
+      # satisfied, but the combination does not compile. See
+      # https://github.com/vicajilau/flutter_file_picker/issues/2186
+      #
+      # A standalone app (outside this workspace, so implementations resolve
+      # from pub.dev instead of the local path) depends on the facade, then
+      # `pub downgrade` forces every dependency to the lowest version its
+      # constraint allows, exactly what an external app's lockfile could
+      # legitimately resolve to. `analyze` does not catch this: a plugin's
+      # platform-specific implementation is only pulled into the type-checked
+      # graph via the generated plugin registrant, which only a real build
+      # produces. `build web` was picked because it needs no extra SDK setup
+      # and, since dart2js compiles the whole plugin registrant regardless of
+      # which platform each implementation targets, it reliably catches this
+      # on every platform's implementation, not just web's.
+      - name: Check facade constraints against a downgraded resolution
+        if: matrix.flutter == 'stable'
+        run: |
+          set -euo pipefail
+
+          # A release branch raises the facade's bounds to the versions it is
+          # about to publish. Those are not on pub.dev yet, so resolution would
+          # fail for a reason that says nothing about whether the constraints
+          # are right. Overriding them to the workspace does not work either,
+          # since every package here declares `resolution: workspace` and pub
+          # then refuses to resolve the facade itself. So this check waits for
+          # the release. `tool/test/facade_constraints_test.dart` covers the
+          # pairing this build cannot produce anyway, the newest interface next
+          # to the oldest allowed implementation, and it reads that from
+          # pub.dev rather than from a resolution.
+          unpublished=""
+          for dir in "$GITHUB_WORKSPACE"/packages/*/; do
+            name=$(sed -n 's/^name: *//p' "$dir/pubspec.yaml" | head -1)
+            version=$(sed -n 's/^version: *//p' "$dir/pubspec.yaml" | head -1)
+            grep -q "^  $name:" "$GITHUB_WORKSPACE/packages/file_picker/pubspec.yaml" || continue
+            if ! curl -sf "https://pub.dev/api/packages/$name" | python3 -c \
+              "import sys,json;sys.exit(0 if any(v['version']=='$version' for v in json.load(sys.stdin)['versions']) else 1)"; then
+              unpublished="$unpublished $name $version,"
+            fi
+          done
+          if [ -n "$unpublished" ]; then
+            echo "::notice::Skipped, the facade requires versions this branch has not published yet:${unpublished%,}"
+            exit 0
+          fi
+
+          app="$(mktemp -d)/facade_constraints_smoke_test"
+          flutter create --platforms=web --org com.example "$app"
+          cd "$app"
+          flutter pub add "file_picker:{\"path\":\"$GITHUB_WORKSPACE/packages/file_picker\"}"
+          echo "import 'package:file_picker/file_picker.dart';" > lib/main.dart
+          echo "void main() => FilePicker.pickFiles();" >> lib/main.dart
+          flutter pub downgrade
+          flutter build web
+
+  build_android:
+    needs: test_flutter_versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          # Last release of the AGP 8.x line. Flutter enforces a minimum AGP
+          # version and raises it over time, so pinning near the top of the
+          # line keeps this lane alive until Flutter drops AGP 8 altogether.
+          - lane: agp-8.x
+            agp_version: 8.13.2
+            gradle_version: 8.14.3
+            kotlin_version: 2.2.20
+            built_in_kotlin: ""
+          - lane: agp-9.x
+            agp_version: 9.2.1
+            gradle_version: 9.5.0
+            kotlin_version: 2.3.21
+            built_in_kotlin: "false"
+    name: Build Android (example app, ${{ matrix.lane }})
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          java -version
+
+      # See tool/patch_android_example.dart to reproduce a failing lane locally.
+      - name: Patch example host app for ${{ matrix.lane }}
+        run: >
+          dart tool/patch_android_example.dart
+          --agp ${{ matrix.agp_version }}
+          --gradle ${{ matrix.gradle_version }}
+          --kotlin ${{ matrix.kotlin_version }}
+          --built-in-kotlin "${{ matrix.built_in_kotlin }}"
+
+      - name: Show Android diff under test
+        run: git --no-pager diff -- example/android | cat
+
+      # Restored after the patch step on purpose: the key has to reflect the
+      # toolchain the lane actually builds with, not the committed one.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ matrix.lane }}-${{ matrix.gradle_version }}-${{ hashFiles('packages/file_picker_android/android/**/*.gradle*', 'example/android/**/*.gradle*') }}
+          restore-keys: |
+            gradle-${{ matrix.lane }}-${{ matrix.gradle_version }}-
+
+      - name: Build Android example
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter build apk --debug
+
+      # JVM unit tests of the Kotlin code that needs no Android runtime. The
+      # build above already set up Gradle and the plugin's project.
+      - name: Run Android unit tests
+        working-directory: example/android
+        run: ./gradlew :android_file_picker:testDebugUnitTest
+
+      # R8 only runs on release builds, so this is the only job that exercises
+      # packages/file_picker_android/android/proguard-rules.pro. The example
+      # signs release with the debug keys, so no secrets are involved.
+      - name: Build Android example (release, exercises R8)
+        if: matrix.lane == 'agp-9.x'
+        working-directory: example
+        run: flutter build apk --release
+
+  build_linux:
+    needs: build_android
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: Build Linux (example app)
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter --version
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libc++-dev libc++abi-dev
+      - name: Enable Linux desktop
+        run: flutter config --enable-linux-desktop
+      - name: Build Linux example
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter build linux
+
+  build_windows:
+    needs: build_linux
+    runs-on: windows-latest
+    timeout-minutes: 30
+    name: Build Windows (example app)
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter --version
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+      - name: Build Windows example
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter build windows
+
+      # The Dart tests otherwise only run on Linux, where path handling differs
+      # from Windows, so the Windows implementation and the facade also run
+      # here, where Windows apps actually run them.
+      - name: Run Dart tests on Windows
+        working-directory: packages/file_picker_windows
+        run: flutter test
+      - name: Run facade tests on Windows
+        working-directory: packages/file_picker
+        run: flutter test
+
+  build_darwin:
+    needs: build_windows
+    runs-on: macos-latest
+    timeout-minutes: 40
+    name: Build Darwin (macOS + iOS example app)
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter --version
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+      - name: Build macOS example
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter build macos
+
+      # Runs the XCTest unit tests for the parts of file_picker_darwin that do
+      # not depend on a system picker. They live in the macOS example's
+      # RunnerTests target, which imports the plugin, and the sources are
+      # shared with iOS. --config-only prepares the Debug configuration that
+      # xcodebuild test needs without building the app a second time.
+      - name: Run native unit tests
+        working-directory: example
+        run: |
+          flutter build macos --debug --config-only
+          xcodebuild test -workspace macos/Runner.xcworkspace -scheme Runner -destination 'platform=macOS'
+
+      # The Dart tests otherwise only run on Linux, so the Darwin
+      # implementation also runs here, on the platform it ships for.
+      - name: Run Dart tests on macOS
+        working-directory: packages/file_picker_darwin
+        run: flutter test
+
+      # file_picker_darwin declares ios and macos with sharedDarwinSource, so
+      # both targets ship from the same sources and both need compiling. Reuses
+      # this runner because macOS minutes bill at 10x.
+      - name: Build iOS example
+        working-directory: example
+        run: flutter build ios --no-codesign
+
+  build_web:
+    needs: build_darwin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: Build Web (example app)
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter --version
+      - name: Enable Web
+        run: flutter config --enable-web
+      # Both backends: JS interop does not behave identically under dart2wasm
+      # and dart2js, and dart2js is still what most apps ship.
+      - name: Build Web example (dart2wasm)
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter build web --wasm
+
+      - name: Build Web example (dart2js)
+        working-directory: example
+        run: flutter build web
+
+  web_integration_test:
+    needs: build_web
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: Web integration test (example app)
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter --version
+      - name: Enable Web
+        run: flutter config --enable-web
+
+      # `flutter drive` always drives web through a WebDriver (chromedriver)
+      # session, even with `-d web-server`, so one has to be running for it to
+      # attach to. Installed alongside a matching Chrome rather than relying
+      # on whatever ships on the runner, to keep the two in lockstep.
+      - uses: browser-actions/setup-chrome@v2
+        id: setup-chrome
+        with:
+          install-chromedriver: true
+
+      - name: Start chromedriver
+        run: ${{ steps.setup-chrome.outputs.chromedriver-path }} --port=4444 &
+
+      # test_driver/integration_test.dart reads the chromedriver session
+      # `flutter drive` creates back out of chromedriver (CHROMEDRIVER_PORT)
+      # to attach its own Chrome DevTools Protocol connection to the same
+      # browser (WEB_PORT identifies its page), which it needs to intercept
+      # the native file-chooser dialog. See that file for why.
+      - name: Run web integration test
+        working-directory: example
+        env:
+          CHROMEDRIVER_PORT: 4444
+          WEB_PORT: 7357
+        run: |
+          flutter pub get
+          flutter drive \
+            -d web-server --web-port=$WEB_PORT \
+            --browser-name=chrome \
+            --chrome-binary="${{ steps.setup-chrome.outputs.chrome-path }}" \
+            --headless \
+            --driver=test_driver/integration_test.dart \
+            --target=integration_test/pick_file_web_test.dart
+
+  # Single stable check for branch protection to require.
+  #
+  # The platform build jobs cannot be required directly. When one is skipped by
+  # its `if:`, GitHub reports it under the job's raw name, and for a matrix job
+  # that name still contains the unexpanded `${{ matrix.lane }}`, so the
+  # contexts that exist when it does run never appear and the pull request
+  # stays blocked on a check that will never report. The `Tests on Flutter
+  # <version>` names have the same problem for a different reason: they come
+  # from tool/fetch_versions.dart and change whenever Flutter releases.
+  #
+  # This job always runs, always reports under the same name, and fails if
+  # anything it depends on did not succeed or get skipped.
+  ci:
+    name: CI
+    needs:
+      - check_changes
+      - setup_flutter_versions
+      - test_flutter_versions
+      - build_android
+      - build_linux
+      - build_windows
+      - build_darwin
+      - build_web
+      - web_integration_test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate source SHA
+        shell: bash
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Fail unless every job succeeded or was skipped
+        run: |
+          set -euo pipefail
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "Upstream results: $results"
+          for result in $results; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::A job this depends on reported '$result'"; exit 1 ;;
+            esac
+          done
