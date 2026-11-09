@@ -1,0 +1,64 @@
+name: Darwin native QA
+run-name: Darwin native QA ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darwin-native-qa-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  darwin:
+    name: Darwin native QA (${{ inputs.source_sha }})
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Validate source SHA
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git show --no-patch --format=fuller HEAD
+          echo "Validated source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter --version
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+      - name: Build macOS example
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter build macos
+      - name: Run native unit tests
+        working-directory: example
+        run: |
+          flutter build macos --debug --config-only
+          xcodebuild test -workspace macos/Runner.xcworkspace -scheme Runner -destination 'platform=macOS'
+      - name: Run Dart tests on macOS
+        working-directory: packages/file_picker_darwin
+        run: flutter test
+      - name: Build iOS example
+        working-directory: example
+        run: flutter build ios --no-codesign
+      - name: Record successful source validation
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "macOS build, native tests, Dart tests and unsigned iOS build passed for $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
