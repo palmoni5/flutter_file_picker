@@ -192,6 +192,40 @@ void main() {
     expect(supportsShowSaveFileDialog, isTrue);
   });
 
+  test('empty downloads complete the saving status', () async {
+    final statuses = <FilePickerStatus>[];
+    final uri = await picker.saveFile(
+      fileName: 'empty.txt',
+      bytes: Uint8List(0),
+      mimeType: 'text/plain',
+      onFileSaving: statuses.add,
+    );
+
+    expect(uri, isNull);
+    expect(downloads, ['empty.txt']);
+    expect(statuses, [FilePickerStatus.picking, FilePickerStatus.done]);
+  });
+
+  test('writes an empty file through the native browser dialog', () async {
+    final handle = _FakeFileHandle('empty.txt');
+    stubPicker(() => Future.value(createJSInteropWrapper(handle)).toJS);
+    final statuses = <FilePickerStatus>[];
+
+    final uri = await picker.saveFile(
+      fileName: 'empty.txt',
+      bytes: Uint8List(0),
+      mimeType: 'text/plain',
+      onFileSaving: statuses.add,
+      webOptions: const FilePickerWebOptions(saveMode: WebSaveFileMode.dialog),
+    );
+
+    expect(uri, Uri(path: 'empty.txt'));
+    expect(handle.writable.written, hasLength(1));
+    expect(handle.writable.written.single, isEmpty);
+    expect(handle.writable.closed, isTrue);
+    expect(statuses, [FilePickerStatus.picking, FilePickerStatus.done]);
+  });
+
   test('sends done when the user cancels the browser save dialog', () async {
     stubPickerError('AbortError');
     final statuses = <FilePickerStatus>[];
